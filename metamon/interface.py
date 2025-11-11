@@ -1317,6 +1317,143 @@ class OpponentMoveObservationSpace(TeamPreviewObservationSpace):
 
 
 @register_observation_space()
+class PPTrackingObservationSpace(ExpandedObservationSpace):
+    """
+    Tracks PP (Power Points) for all moves of all Pokemon (both player's team and seen opponents).
+
+    This observation space extends ExpandedObservationSpace and adds comprehensive PP tracking:
+    - Player's team: All 6 Pokemon with their moves' PP (even when on bench)
+    - Opponent's team: All seen Pokemon with their moves' PP (tracked historically)
+
+    PP is represented as ratios (current_pp / max_pp) to normalize across different moves.
+    Unseen Pokemon or moves are represented with -1.0 as a sentinel value.
+
+    Adds 48 numerical features: 12 Pokemon × 4 moves = 48 PP ratio values
+    """
+
+    def reset(self):
+        super().reset()
+        # Dictionary to store PP tracking: {pokemon_name: {move_name: (current_pp, max_pp)}}
+        self.player_pokemon_pp = {}
+        self.opponent_pokemon_pp = {}
+        # Track order of Pokemon as we see them (for consistent indexing)
+        self.player_pokemon_order = []
+        self.opponent_pokemon_order = []
+
+    @property
+    def gym_space(self):
+        base_space = super().gym_space
+        # Add 48 PP ratio features (12 Pokemon × 4 moves)
+        # Range: -1.0 (unseen) to 1.0 (full PP)
+        base_space["numbers"] = gym.spaces.Box(
+            low=-10.0,
+            high=10.0,
+            shape=(55 + 48,),  # 55 from ExpandedObservationSpace + 48 for PP tracking
+            dtype=np.float32,
+        )
+        return base_space
+
+    def _update_pokemon_pp_tracking(self, pokemon: UniversalPokemon, pp_dict: dict, order_list: list):
+        """
+        Update PP tracking for a given Pokemon.
+
+        Args:
+            pokemon: UniversalPokemon object to track
+            pp_dict: Dictionary storing PP data for this side (player/opponent)
+            order_list: List maintaining order of seen Pokemon
+        """
+        pokemon_name = pokemon.base_species
+
+        # Track this Pokemon if not seen before
+        if pokemon_name not in order_list:
+            order_list.append(pokemon_name)
+
+        # Initialize or update PP data for this Pokemon
+        if pokemon_name not in pp_dict:
+            pp_dict[pokemon_name] = {}
+
+        # Update PP for each move
+        for move in pokemon.moves[:4]:  # Max 4 moves
+            move_name = move.name
+            pp_dict[pokemon_name][move_name] = (move.current_pp, move.max_pp)
+
+    def _get_pp_features_for_side(self, pp_dict: dict, order_list: list) -> list[float]:
+        """
+        Extract PP features for one side (player or opponent).
+
+        Returns a list of 24 PP ratio values (6 Pokemon × 4 moves).
+        Uses -1.0 for unseen Pokemon/moves.
+        """
+        pp_features = []
+
+        for i in range(6):  # Always 6 Pokemon slots
+            if i < len(order_list):
+                pokemon_name = order_list[i]
+                pokemon_pp = pp_dict.get(pokemon_name, {})
+
+                # Get PP ratios for up to 4 moves, sorted alphabetically
+                move_names = sorted(pokemon_pp.keys())[:4]
+
+                for j in range(4):  # Always 4 move slots
+                    if j < len(move_names):
+                        move_name = move_names[j]
+                        current_pp, max_pp = pokemon_pp[move_name]
+                        if max_pp > 0:
+                            pp_ratio = current_pp / max_pp
+                        else:
+                            pp_ratio = 0.0
+                        pp_features.append(pp_ratio)
+                    else:
+                        # No move in this slot
+                        pp_features.append(-1.0)
+            else:
+                # No Pokemon in this slot yet
+                pp_features.extend([-1.0] * 4)
+
+        return pp_features
+
+    def state_to_obs(self, state: UniversalState):
+        # Get base observation from ExpandedObservationSpace
+        obs = super().state_to_obs(state)
+
+        # Update player's full team PP (active + bench)
+        self._update_pokemon_pp_tracking(
+            state.player_active_pokemon,
+            self.player_pokemon_pp,
+            self.player_pokemon_order
+        )
+        for pokemon in state.available_switches:
+            self._update_pokemon_pp_tracking(
+                pokemon,
+                self.player_pokemon_pp,
+                self.player_pokemon_order
+            )
+
+        # Update opponent's active Pokemon PP (historical tracking)
+        self._update_pokemon_pp_tracking(
+            state.opponent_active_pokemon,
+            self.opponent_pokemon_pp,
+            self.opponent_pokemon_order
+        )
+
+        # Build PP features: 24 for player + 24 for opponent = 48 total
+        player_pp_features = self._get_pp_features_for_side(
+            self.player_pokemon_pp,
+            self.player_pokemon_order
+        )
+        opponent_pp_features = self._get_pp_features_for_side(
+            self.opponent_pokemon_pp,
+            self.opponent_pokemon_order
+        )
+
+        # Concatenate PP features to observation
+        all_pp_features = np.array(player_pp_features + opponent_pp_features, dtype=np.float32)
+        obs["numbers"] = np.concatenate([obs["numbers"], all_pp_features])
+
+        return obs
+
+
+@register_observation_space()
 class PatchPokeAgentTeraBug(ObservationSpace):
     """
     Intentionally reintroduces a bug in the "pokeagent" backend that has been fixed.
